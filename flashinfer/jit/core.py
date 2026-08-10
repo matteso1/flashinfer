@@ -1,6 +1,7 @@
 import abc
 import dataclasses
 import functools
+import hashlib
 import logging
 import os
 from contextlib import nullcontext
@@ -332,17 +333,31 @@ class JitSpecNvcc(JitSpec):
     is_class: bool = False
     needs_device_linking: bool = False
 
+    def _ninja_build_content(self) -> str:
+        return generate_ninja_build_for_op(
+            name=self.name,
+            sources=self.sources,
+            extra_cflags=self.extra_cflags,
+            extra_cuda_cflags=self.extra_cuda_cflags,
+            extra_ldflags=self.extra_ldflags,
+            extra_include_dirs=self.extra_include_dirs,
+            needs_device_linking=self.needs_device_linking,
+        )
+
+    def _ninja_build_digest(self) -> str:
+        return hashlib.sha256(self._ninja_build_content().encode("utf-8")).hexdigest()
+
     @property
     def ninja_path(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name / "build.ninja"
+        return self.build_dir / "build.ninja"
 
     @property
     def build_dir(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name
+        return jit_env.FLASHINFER_JIT_DIR / self.name / self._ninja_build_digest()
 
     @property
     def jit_library_path(self) -> Path:
-        return jit_env.FLASHINFER_JIT_DIR / self.name / f"{self.name}.so"
+        return self.build_dir / f"{self.name}.so"
 
     def get_library_path(self) -> Path:
         if self.is_aot:
@@ -373,11 +388,12 @@ class JitSpecNvcc(JitSpec):
 
     @property
     def lock_path(self) -> Path:
-        return get_tmpdir() / f"{self.name}.lock"
+        return get_tmpdir() / f"{self.name}_{self._ninja_build_digest()}.lock"
 
     def write_ninja(self) -> None:
         ninja_path = self.ninja_path
         self.build_dir.mkdir(parents=True, exist_ok=True)
+        output_prefix = self.build_dir.relative_to(jit_env.FLASHINFER_JIT_DIR)
         content = generate_ninja_build_for_op(
             name=self.name,
             sources=self.sources,
@@ -386,6 +402,7 @@ class JitSpecNvcc(JitSpec):
             extra_ldflags=self.extra_ldflags,
             extra_include_dirs=self.extra_include_dirs,
             needs_device_linking=self.needs_device_linking,
+            output_prefix=output_prefix,
         )
         write_if_different(ninja_path, content)
 
@@ -424,7 +441,7 @@ class JitSpecNvcc(JitSpec):
         )
         with lock:
             self.write_ninja()
-            run_ninja(self.build_dir, self.ninja_path, verbose)
+            run_ninja(jit_env.FLASHINFER_JIT_DIR, self.ninja_path, verbose)
 
     def load(self, so_path: Optional[Path] = None):
         return tvm_ffi.load_module(str(so_path or self.jit_library_path))

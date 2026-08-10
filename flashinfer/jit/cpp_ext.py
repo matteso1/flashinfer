@@ -44,13 +44,28 @@ def _get_glibcxx_abi_build_flags() -> List[str]:
     return glibcxx_abi_cflags
 
 
-@functools.cache
 def get_cuda_path() -> str:
-    cuda_home = os.environ.get("CUDA_HOME") or os.environ.get("CUDA_PATH")
+    return _get_cuda_path(
+        os.environ.get("CUDA_HOME"),
+        os.environ.get("CUDA_PATH"),
+        os.environ.get("PATH"),
+    )
+
+
+@functools.cache
+def _get_cuda_path(
+    cuda_home: Optional[str], cuda_path: Optional[str], search_path: Optional[str]
+) -> str:
+    cuda_home = cuda_home or cuda_path
     if cuda_home is not None:
         return cuda_home
     # get output of "which nvcc"
-    nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True)
+    env = os.environ.copy()
+    if search_path is None:
+        env.pop("PATH", None)
+    else:
+        env["PATH"] = search_path
+    nvcc_path = subprocess.run(["which", "nvcc"], capture_output=True, env=env)
     if nvcc_path.returncode == 0:
         cuda_home = os.path.dirname(
             os.path.dirname(nvcc_path.stdout.decode("utf-8").strip())
@@ -64,11 +79,14 @@ def get_cuda_path() -> str:
     return cuda_home
 
 
-@functools.cache
 def get_cuda_version() -> Version:
+    return _get_cuda_version(get_cuda_path(), torch.version.cuda)
+
+
+@functools.cache
+def _get_cuda_version(cuda_home: str, torch_cuda_version: Optional[str]) -> Version:
     # Try to query nvcc for CUDA version; if nvcc is unavailable, fall back to torch.version.cuda
     try:
-        cuda_home = get_cuda_path()
         nvcc = os.path.join(cuda_home, "bin/nvcc")
         txt = subprocess.check_output([nvcc, "--version"], text=True)
         matches = re.findall(r"release (\d+\.\d+),", txt)
@@ -79,12 +97,12 @@ def get_cuda_version() -> Version:
         return Version(matches[0])
     except (RuntimeError, FileNotFoundError, subprocess.CalledProcessError) as e:
         # NOTE(Zihao): when nvcc is unavailable, fall back to torch.version.cuda
-        if torch.version.cuda is None:
+        if torch_cuda_version is None:
             raise RuntimeError(
                 "nvcc not found and PyTorch is not built with CUDA support. "
                 "Could not determine CUDA version."
             ) from e
-        return Version(torch.version.cuda)
+        return Version(torch_cuda_version)
 
 
 def is_cuda_version_at_least(version_str: str) -> bool:
@@ -245,6 +263,7 @@ def generate_ninja_build_for_op(
     extra_ldflags: Optional[List[str]],
     extra_include_dirs: Optional[List[Path]],
     needs_device_linking: bool = False,
+    output_prefix: Optional[Path] = None,
 ) -> str:
     cuda_home = get_cuda_path()
     common_cflags = build_common_cflags(cuda_home, extra_include_dirs)
@@ -280,6 +299,10 @@ def generate_ninja_build_for_op(
         f"nvcc = {nvcc}",
         f"cxx_launcher = {cxx_launcher}",
         f"nvcc_launcher = {nvcc_launcher}",
+    ]
+    if output_prefix is not None:
+        lines.append(f"builddir = {output_prefix.as_posix()}/.ninja")
+    lines += [
         "",
         "common_cflags = " + join_multiline(common_cflags),
         "cflags = " + join_multiline(cflags),
@@ -318,26 +341,25 @@ def generate_ninja_build_for_op(
             ]
         )
 
-    # Use absolute paths for outputs so ninja files work with any workdir
-    # This enables isolated workdirs for runtime JIT (avoiding .ninja_log races)
-    # while still supporting subninja for parallel AOT builds
-    output_dir = jit_env.FLASHINFER_JIT_DIR / name
-
     objects = []
     for source in sources:
         is_cuda = source.suffix == ".cu"
         object_suffix = ".cuda.o" if is_cuda else ".o"
         cmd = "cuda_compile" if is_cuda else "compile"
         obj_name = f"{source.parent.name}_{source.stem}{object_suffix}"
-        obj = str((output_dir / obj_name).resolve())
-        objects.append(obj)
-        lines.append(f"build {obj}: {cmd} {source.resolve()}")
+        obj = output_prefix / obj_name if output_prefix is not None else Path(obj_name)
+        objects.append(obj.as_posix())
+        lines.append(f"build {obj.as_posix()}: {cmd} {source.resolve()}")
 
     lines.append("")
     link_rule = "nvcc_link" if needs_device_linking else "link"
-    output_so = str((output_dir / f"{name}.so").resolve())
-    lines.append(f"build {output_so}: {link_rule} " + " ".join(objects))
-    lines.append(f"default {output_so}")
+    output_so = (
+        output_prefix / f"{name}.so"
+        if output_prefix is not None
+        else Path(f"{name}.so")
+    )
+    lines.append(f"build {output_so.as_posix()}: {link_rule} " + " ".join(objects))
+    lines.append(f"default {output_so.as_posix()}")
     lines.append("")
 
     return "\n".join(lines)

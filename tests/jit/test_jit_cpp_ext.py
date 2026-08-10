@@ -1,10 +1,13 @@
 import subprocess
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
+from packaging.version import Version
 
 import flashinfer
+from flashinfer import aot
 from flashinfer.jit import core, cpp_ext
 from flashinfer.jit.attention import modules as attention_modules
 from flashinfer.utils import (
@@ -132,6 +135,7 @@ def test_run_ninja_uses_max_jobs(monkeypatch, tmp_path):
 def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
     writes = []
     monkeypatch.delenv("FLASHINFER_DISABLE_JIT", raising=False)
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
 
     spec = core.JitSpecNvcc(
         name="test_module",
@@ -148,6 +152,128 @@ def test_jit_spec_build_rewrites_ninja_before_build(monkeypatch):
     spec.build(verbose=False, need_lock=False)
 
     assert writes == [True]
+
+
+def _test_jit_spec(name: str, source: Path, extra_cuda_cflags=None):
+    return core.JitSpecNvcc(
+        name=name,
+        sources=[source],
+        extra_cflags=None,
+        extra_cuda_cflags=extra_cuda_cflags,
+        extra_ldflags=None,
+        extra_include_dirs=None,
+    )
+
+
+def test_jit_build_identity_changes_with_compile_inputs(monkeypatch, tmp_path):
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    source = tmp_path / "sources" / "kernel.cu"
+
+    first = _test_jit_spec("test_module", source, ["-DFIRST"])
+    second = _test_jit_spec("test_module", source, ["-DSECOND"])
+
+    assert first.build_dir != second.build_dir
+    assert first.lock_path != second.lock_path
+
+
+def test_jit_build_identity_tracks_cuda_home_in_same_process(monkeypatch, tmp_path):
+    nvcc_calls = []
+
+    def fake_check_output(command, **_kwargs):
+        nvcc_calls.append(command[0])
+        return "Cuda compilation tools, release 13.0, V13.0.0"
+
+    monkeypatch.setattr(cpp_ext.subprocess, "check_output", fake_check_output)
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", tmp_path / "jit")
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.9")
+    source = tmp_path / "sources" / "kernel.cu"
+    spec = _test_jit_spec("test_module", source)
+
+    first_cuda_home = tmp_path / "cuda-first"
+    second_cuda_home = tmp_path / "cuda-second"
+    monkeypatch.setenv("CUDA_HOME", str(first_cuda_home))
+    first_build_dir = spec.build_dir
+    monkeypatch.setenv("CUDA_HOME", str(second_cuda_home))
+    second_build_dir = spec.build_dir
+
+    assert first_build_dir != second_build_dir
+    assert nvcc_calls == [
+        str(first_cuda_home / "bin" / "nvcc"),
+        str(second_cuda_home / "bin" / "nvcc"),
+    ]
+
+
+def test_jit_ninja_is_relocatable_and_scoped_to_its_build_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    source = tmp_path / "sources" / "kernel.cu"
+    roots = [tmp_path / "first-root", tmp_path / "second-root"]
+    generated = []
+    relative_build_dirs = []
+
+    for root in roots:
+        monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", root)
+        spec = _test_jit_spec("test_module", source)
+        spec.write_ninja()
+        generated.append(spec.ninja_path.read_text())
+        relative_build_dirs.append(spec.build_dir.relative_to(root))
+
+    assert relative_build_dirs[0] == relative_build_dirs[1]
+    assert generated[0] == generated[1]
+    assert str(roots[0].resolve()) not in generated[0]
+    assert str(roots[1].resolve()) not in generated[1]
+
+    output_prefix = relative_build_dirs[0].as_posix()
+    assert f"builddir = {output_prefix}/.ninja" in generated[0]
+    assert f"build {output_prefix}/sources_kernel.cuda.o:" in generated[0]
+    assert f"build {output_prefix}/test_module.so:" in generated[0]
+
+
+def test_root_aot_subninja_manifest_parses(monkeypatch, tmp_path):
+    monkeypatch.setattr(cpp_ext, "get_cuda_path", lambda: "/usr/local/cuda")
+    monkeypatch.setattr(cpp_ext, "get_cuda_version", lambda: Version("13.0"))
+    monkeypatch.setenv("FLASHINFER_CUDA_ARCH_LIST", "8.9")
+    root = tmp_path / "jit"
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", root)
+    source = tmp_path / "sources" / "kernel.cu"
+    specs = [
+        _test_jit_spec("first_module", source),
+        _test_jit_spec("second_module", source),
+    ]
+
+    for spec in specs:
+        spec.write_ninja()
+
+    aggregate = root / "aggregate.ninja"
+    aggregate.write_text(
+        "ninja_required_version = 1.3\n"
+        + "".join(f"subninja {spec.ninja_path}\n" for spec in specs)
+    )
+    parsed = subprocess.run(
+        ["ninja", "-f", str(aggregate), "-t", "targets"],
+        cwd=root,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert parsed.returncode == 0, parsed.stderr
+    for spec in specs:
+        assert str(spec.jit_library_path.relative_to(root)) in parsed.stdout
+
+
+def test_copy_built_kernels_uses_digest_scoped_source(monkeypatch, tmp_path):
+    root = tmp_path / "jit"
+    monkeypatch.setattr(core.jit_env, "FLASHINFER_JIT_DIR", root)
+    spec = _test_jit_spec("test_module", tmp_path / "sources" / "kernel.cu")
+    monkeypatch.setattr(spec, "_ninja_build_digest", lambda: "test-digest")
+    spec.jit_library_path.parent.mkdir(parents=True)
+    spec.jit_library_path.write_bytes(b"test-library")
+
+    out = tmp_path / "out"
+    aot.copy_built_kernels([spec], out)
+
+    assert (out / "test_module" / "test_module.so").read_bytes() == b"test-library"
 
 
 def test_customize_batch_prefill_nvfp4_large_head_uses_prefill_flags(
